@@ -177,10 +177,11 @@
   .draft-title { font-weight: 700; font-size: 0.95rem; }
   .field-row { display: flex; flex-direction: column; gap: 6px; }
   .field-row label { font-size: 0.78rem; font-weight: 500; color: var(--ink-soft); }
-  select, .manual textarea, input[type="text"], input[type="password"] {
+  select, .manual textarea, input[type="text"], input[type="password"], input[type="search"] {
     width: 100%; border: 1px solid var(--line); border-radius: 10px;
     background: var(--paper); color: var(--ink); padding: 10px 12px; font-size: 0.9rem;
   }
+  .manual input[type="search"] { font-size: 1rem; padding: 13px 14px; border-radius: 12px; }
   .check-row { display: flex; align-items: center; gap: 8px; font-size: 0.85rem; color: var(--ink-soft); }
   .check-row input { width: 16px; height: 16px; accent-color: var(--accent); }
   .preview-scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; }
@@ -243,6 +244,12 @@
   .answer-a-wrap { color: var(--ink); }
 
   .alt-list { display: flex; flex-direction: column; gap: 8px; }
+  .hit-list { display: flex; flex-direction: column; gap: 10px; }
+  .hit-card {
+    background: var(--paper-card); border: 1px solid var(--line); border-radius: 14px;
+    padding: 14px; display: flex; flex-direction: column; gap: 8px;
+  }
+  .hit-card .answer-a { font-size: 1rem; }
   .alt-card {
     background: var(--paper-alt); border: 1px solid var(--line); border-radius: 12px;
     padding: 11px 13px; font-size: 0.82rem; display: flex; flex-direction: column; gap: 3px;
@@ -311,6 +318,7 @@ const EMBEDDED_WORKBOOK = [{"name":"문제집","rows":[["","","","","①","1",""
     query: { text: '' },
     querySource: 'camera',
     matches: [],
+    manualText: '',
     uploadDraft: null,
     ocrEngine: null,
     ocrEnginePromise: null,
@@ -378,6 +386,33 @@ const EMBEDDED_WORKBOOK = [{"name":"문제집","rows":[["","","","","①","1",""
       if (out.length >= 3) break;
     }
     return out;
+  }
+  // Typed search: questions containing every typed word (in the stem or options) come first, ranked by similarity;
+  // remaining slots fall back to similarity alone, which catches spelling variants like "로로선" vs "로로(Ro-Ro)선".
+  function keywordSearch(rows, input, limit) {
+    const words = input.split(/\s+/).map(normalize).filter(Boolean);
+    if (!words.length) return { items: [], exactCount: 0 };
+    const qb = bigramBag(input);
+    const seen = new Set();
+    const exact = [], rest = [];
+    for (const r of rows) {
+      const key = normalize(r.q);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const bags = rowBags(r);
+      const score = Math.max(dice(qb, bags.q), bags.full ? dice(qb, bags.full) : 0);
+      const item = { q: r.q, symbol: r.symbol, text: r.text, sheet: r.sheet, score };
+      const hay = bags.full ? bags.full.n : bags.q.n;
+      (words.every((w) => hay.includes(w)) ? exact : rest).push(item);
+    }
+    exact.sort((a, b) => b.score - a.score);
+    rest.sort((a, b) => b.score - a.score);
+    const items = exact.slice(0, limit).map((x) => Object.assign(x, { exact: true }));
+    for (const x of rest) {
+      if (items.length >= limit || x.score <= 0.08) break;
+      items.push(Object.assign(x, { exact: false }));
+    }
+    return { items, exactCount: exact.length };
   }
 
   // ---------- storage: localStorage ----------
@@ -1023,21 +1058,48 @@ const EMBEDDED_WORKBOOK = [{"name":"문제집","rows":[["","","","","①","1",""
       '<div class="manual">' +
       '<button class="icon-btn" id="backBtn">' + ICONS.back + '</button>' +
       '<h2 class="section-title">문제 직접 입력</h2>' +
-      '<textarea id="manualInput" placeholder="문제 내용을 입력하세요 (일부 문장만 입력해도 괜찮아요)"></textarea>' +
-      '<button class="btn-primary btn-block" id="manualSearchBtn">' + ICONS.search + ' 정답 찾기</button>' +
+      '<input type="search" id="manualInput" enterkeyhint="search" autocomplete="off" spellcheck="false" ' +
+      'placeholder="문제 속 단어 2~3개 (예: 선하증권 법적 성질)" value="' + escapeHtml(state.manualText) + '">' +
+      '<div class="hit-list" id="manualResults"></div>' +
       '</div>'
     );
   }
+  function renderManualResults(text) {
+    const box = document.getElementById('manualResults');
+    if (!box) return;
+    if (!text.trim()) {
+      box.innerHTML = '<p class="hint-text">단어를 띄어서 입력하면 치는 동안 바로 찾아줘요.</p>';
+      return;
+    }
+    const { items, exactCount } = keywordSearch(state.dataset.rows, text, 5);
+    if (!items.length) {
+      box.innerHTML = '<div class="empty-card">맞는 문제가 없어요. 다른 단어로 찾아보세요.</div>';
+      return;
+    }
+    const head = exactCount
+      ? '단어가 모두 들어간 문제 ' + exactCount + '개' + (exactCount > 5 ? ' · 단어를 더 넣으면 좁혀져요' : '')
+      : '단어가 모두 들어간 문제는 없어서 비슷한 문제를 보여드려요';
+    box.innerHTML = '<p class="row-count">' + head + '</p>' + items.map((m) =>
+      '<div class="hit-card">' +
+      '<div class="confidence-row"><span class="confidence-pill ' + (m.exact ? 'good' : 'warn') + '">' + (m.exact ? '단어 일치' : '비슷한 문제') + '</span>' +
+      (m.sheet ? '<span class="sheet-tag">' + escapeHtml(m.sheet) + '</span>' : '') + '</div>' +
+      '<p class="answer-q">' + escapeHtml(m.q) + '</p>' +
+      '<p class="answer-a-wrap"><span class="answer-a">' + escapeHtml(answerLabel(m)) + '</span></p>' +
+      '</div>'
+    ).join('');
+  }
   function bindManual() {
     document.getElementById('backBtn').addEventListener('click', () => setView('scan'));
-    document.getElementById('manualSearchBtn').addEventListener('click', () => {
-      const val = document.getElementById('manualInput').value.trim();
-      if (!val) return;
-      state.query = { text: val };
-      state.querySource = 'manual';
-      state.matches = findMatches(state.dataset.rows, state.query);
-      setView('result');
+    const input = document.getElementById('manualInput');
+    let timer = null;
+    input.addEventListener('input', () => {
+      state.manualText = input.value;
+      clearTimeout(timer);
+      timer = setTimeout(() => renderManualResults(input.value), 120);
     });
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') input.blur(); });
+    renderManualResults(input.value);
+    input.focus();
   }
 
   // ---------- result view ----------
